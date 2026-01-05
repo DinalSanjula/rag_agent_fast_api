@@ -15,18 +15,24 @@ from langchain_openai import ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 from pydantic import BaseModel
 
 app = FastAPI(title="HR Rang agent")
 
 class QueryRequest(BaseModel):
-    user_id:int
+    user_id:str
     question:str
 
 
 class QueryResponse(BaseModel):
     question:str
     answer:str
+    user_id:str
+    message:str
+    status:str
+
+
 
 
 load_dotenv()
@@ -115,7 +121,7 @@ system_prompt = """
                 You also have access to a tool which allows to write output content to a file
                 use it when required tool name - write_results_to_file args: (content: last_message from AI, filename: name of the file)qwqwq
                 Use the tool to help answer user queries
-"""
+                """
 
 
 
@@ -138,22 +144,43 @@ agent = create_agent(model=openai_model,
                      checkpointer=InMemorySaver(),
                      )
 
-# while 1:
-#     question = input("What is your question ")
-#
-#     resp = agent.invoke({"messages" : [{"role":"user","content":question}]})
-#     print(resp["messages"][-1].content)
+class ApproveRequest(BaseModel):
+    user_id:str
+    decision: str
+
+@app.post("/approve")
+def human_approval_requests(request:ApproveRequest):
+    config ={"configurable":{"thread_id" : request.user_id}}
+    result = agent.invoke(
+        Command(resume={"decisions":[{"type" : request.decision}]}),
+        config=config
+    )
+
+    answer = result["messages"][-1].content if result.get("messages") else "No answer"
+    return answer
 
 @app.post("/query",response_model=QueryResponse)
 def query(request:QueryRequest):
     config ={"configurable":{"thread_id": request.user_id}}
     resp = agent.invoke({"messages":[{"role":"user","content": request.question }]},
                         config=config)
-    print(resp)
+
+
+    if '__interrupt__' in resp:
+        return QueryResponse(
+            question=request.question,
+            answer="No Answer",
+            user_id=request.user_id,
+            message="Write to file tool is pending human approval",
+            status="Interrupted"
+        )
 
     return QueryResponse(
         question=request.question,
-        answer=resp["messages"][-1].content
+        answer=resp["messages"][-1].content,
+        user_id=request.user_id,
+        message="Success",
+        status="Success"
     )
 
 
