@@ -149,11 +149,14 @@ def query(request:QueryRequest):
     config ={"configurable":{"thread_id": request.user_id}}
     resp = agent.invoke({"messages":[{"role":"user","content": request.question }]},
                         config=config)
+    print(resp)
 
     return QueryResponse(
         question=request.question,
         answer=resp["messages"][-1].content
     )
+
+
 
 
 
