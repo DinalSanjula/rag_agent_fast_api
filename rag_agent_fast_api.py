@@ -4,27 +4,35 @@ from pprint import pprint
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 
 app = FastAPI(title="HR Rang agent")
 
 class QueryRequest(BaseModel):
+    user_id:int
     question:str
+
 
 class QueryResponse(BaseModel):
     question:str
     answer:str
 
+
 load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+OPENROUTER_KEY= os.getenv("OPENROUTER_KEY")
+OPENROUTER_URL= os.getenv("OPENROUTER_URL")
 
 loader = PyPDFLoader('hr_manual.pdf')
 
@@ -40,7 +48,7 @@ vector_store = PineconeVectorStore(index_name="weekdayhrdocument",embedding=embe
 
 
 llm_model = ChatOllama(model="llama3.2:latest")
-
+openai_model = ChatOpenAI(model="gpt-5.2-2025-12-11")
 @tool
 def retrieve_context(enhanced_user_query:str):
     """Retrieve information to hel[ answer user queries using enhanced_query
@@ -73,22 +81,62 @@ def enhance_user_query(user_query: str):
         
         Instructions:
         - Expand abbreviation ( PTO - paid time off, HR - human resource, etc)
-        - Include releven keywords for HR context
+        - Include relevent keywords for HR context
         - Maintain original intent
         """
     )
 
-    enhancement_chain = enhancement_prompt | llm_model
+    enhancement_chain = enhancement_prompt | openai_model
     resp = enhancement_chain.invoke({"original_query" : user_query})
     return resp.content
 
+@tool
+def write_results_to_file(content:str, file_name:str = "hr_query_results.txt"):
+    """
+    Write query results to a text file for persistent storage.
+
+    Args:
+        content: The result content to write
+        file_name: target filename ( default : query_results.txt)
+
+    returns:
+     Confirmation message of successful write
+    """
+    try:
+        with open(file_name, "a") as f:
+            f.write(str(content))
+            return f"successfully wrote contents to filename - {file_name}"
+    except Exception as e:
+        return f"Error writing to file : {str(e)}"
+
+
 system_prompt = """
-You have access to a tools that enhances user  wuery and retrieves context from hr documents.
-Use the tool to help answer user queries.
+                You have access to tools that enhances user query and retrieves context from hr documents.
+                You also have access to a tool which allows to write output content to a file
+                use it when required tool name - write_results_to_file args: (content: last_message from AI, filename: name of the file)qwqwq
+                Use the tool to help answer user queries
 """
 
-tools = [retrieve_context,enhance_user_query]
-agent = create_agent(model=llm_model,system_prompt=system_prompt,tools=tools)
+
+
+tools = [retrieve_context,enhance_user_query,write_results_to_file]
+agent = create_agent(model=openai_model,
+                     system_prompt=system_prompt,
+                     tools=tools,
+                     middleware=[
+                         HumanInTheLoopMiddleware(
+                             interrupt_on={
+                                 "retrieve_context": False,
+                                 "enhance_user_query": False,
+                                 "write_results_to_file" : True
+                             },
+                             # Prefix for interrupt messages - combined with tool name and args to form the full message
+                             # e.g., "Tool execution pending approval: execute_sql with query='DELETE FROM...'"
+                             # Individual tools can override this by specifying a "description" in their interrupt config
+                             description_prefix="Tool execution pending approval",
+                         )],
+                     checkpointer=InMemorySaver(),
+                     )
 
 # while 1:
 #     question = input("What is your question ")
@@ -98,10 +146,14 @@ agent = create_agent(model=llm_model,system_prompt=system_prompt,tools=tools)
 
 @app.post("/query",response_model=QueryResponse)
 def query(request:QueryRequest):
-    resp = agent.invoke({"messages":[{"role":"user","content": request.question }]})
+    config ={"configurable":{"thread_id": request.user_id}}
+    resp = agent.invoke({"messages":[{"role":"user","content": request.question }]},
+                        config=config)
 
     return QueryResponse(
         question=request.question,
         answer=resp["messages"][-1].content
     )
+
+
 
